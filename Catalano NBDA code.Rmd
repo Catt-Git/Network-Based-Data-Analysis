@@ -1,0 +1,838 @@
+---
+title: "Catalano NBDA final"
+author: "Alberto Catalano"
+date: "2025-06-16"
+output: pdf_document
+---
+```{r, message= FALSE, warninig=FALSE}
+library("GEOquery")
+library("useful")
+library("genefilter")
+library(randomForest)
+library(RColorBrewer)
+library("pROC")
+library("caret")
+library("glmnet")
+library("ROCR")
+library("rScudo")
+library("igraph")
+library(gprofiler2)
+library("KEGGREST")
+library("KEGGgraph")
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+library("pathfindR")
+library("MASS")
+library("factoextra")
+library("cluster")
+library(genefilter)
+library(hgu133a.db)
+library(AnnotationDbi)
+library(pathfindR)
+```
+
+# IMPORTANT NOTE
+It was not required to submit the code, but only a .pdf file and a presentation. This is the reason why my code is not clean and probably it is a little chaotic. So, use this as a reference to see what you need to analyze!
+
+#DATA LOADING AND PRE-PROCESSING
+
+```{r}
+gse<- getGEO("GSE17913") 
+#gse <- getGEO(file= "GSE17913_series_matrix.txt.gz")
+gse <- gse[[1]]
+```
+
+```{r}
+ex_raw <- exprs(gse)
+dim(ex_raw) #54k are the genes from the microarray
+colnames(ex_raw) #79 samples (individuals) each identified by a GEO ID like GSM447398, ecc...
+metadata <- pData(gse)
+ex_raw <- scale(log2(ex_raw))
+```
+
+
+```{r}
+boxplot(ex_raw, main = "Scaled log2 gene expression values across samples", xlab = "Samples", ylab = "log2 values")
+```
+
+## FEATURE SELECTION
+
+First select the top 10000 most variable genes in terms of variance
+
+```{r}
+# Compute variance for each gene (row)
+gene_variances <- apply(ex_raw, 1, var)
+
+# Get top 10k genes by variance
+top10k_idx <- order(gene_variances, decreasing = TRUE)[1:10000]
+ex_top10k <- ex_raw[top10k_idx, ]
+
+```
+
+Then  we can do  a t-test on every pairwise and select only the  p-values < 0.05 or 0.1
+
+```{r}
+# Run t-tests per gene between Smoker and NeverSmoker
+group <- metadata$`smoking status:ch1`
+group1 <- which(group == "Smoker")
+group2 <- which(group == "Never Smoker")
+
+# Apply t-test for each gene
+ttest_results <- apply(ex_top10k, 1, function(gene_expr) {
+  t.test(gene_expr[group1], gene_expr[group2])$p.value
+})
+
+# Adjust p-values using FDR
+p_adj <- p.adjust(ttest_results, method = "fdr")
+
+# Extract significant genes (adjusted p < 0.05)
+sig_genes <- names(p_adj)[p_adj < 0.1]
+
+# Subset the expression matrix
+ex <- ex_top10k[sig_genes, ]
+ex <- scale(ex)
+```
+
+Now ex is our filtered and default dataset of 803 obs
+Now we have reduced the noise, we can continue with the other analysis
+
+```{r}
+boxplot(ex, main = "Scaled log2 gene expression values across samples", xlab = "Samples", ylab = "log2 values")
+dim(ex)
+```
+## PCA
+
+```{r}
+#PCA screeplot
+pca <- prcomp(t(ex), center = TRUE, scale. = FALSE)
+pca_table <-get_eig(pca)
+pca_table
+
+fviz_eig(pca,
+         main = "Variance described by each PC",
+         addlabels = TRUE,
+         barfill = "#1E88E5",
+         barcolor = "black") +
+  ylim(0, max(get_eig(pca)[, "variance.percent"]) + 2)
+```
+
+```{r}
+#PCA plot
+grpcol <- ifelse(metadata$`smoking status:ch1` == "Never Smoker", "#FF801F", "#1E88E5")
+plot(pca$x[,1], pca$x[,2], 
+     xlab="PCA1", ylab="PCA2", 
+     main="PCA for components 1&2", 
+     type="p", pch = 19 , col=grpcol)
+legend("topright", 
+       legend=c("Never Smoker", "Smoker"), 
+       col=c("#FF801F", "#1E88E5"), 
+       pch=19)
+```
+PCA NO PRE PROCESS
+```{r}
+pca_raw <- prcomp(t(ex_raw), center = TRUE, scale. = FALSE)
+plot(pca_raw$x[,1], pca_raw$x[,2], 
+     xlab="PCA1", ylab="PCA2", 
+     main="Unprocessed PCA for components 1&2 ", 
+     type="p", pch = 19 , col=grpcol)
+legend("topright", 
+       legend=c("Never Smoker", "Smoker"), 
+       col=c("#FF801F", "#1E88E5"), 
+       pch=19)
+```
+
+
+## CLUSTERING
+
+```{r}
+#K-Means
+set.seed(123)
+k <- 2
+kmeans_result <- kmeans(t(ex), k)
+table(kmeans_result$cluster)    # cluster 1 has 50 obs and 2 has 29
+plot(kmeans_result, data = t(ex)) +
+  labs(title = "K-means clustering") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_text(aes(label = gse$`smoking status:ch1`), hjust=0, vjust=0, cex = 2) +
+  scale_color_manual(values = c("#FF801F", "#1E88E5")) 
+```
+```{r}
+#Hierarchical clustering
+set.seed(123)
+dist_matrix <- dist(t(ex))
+hc_result<- hclust(dist_matrix, method = "ward.D2")
+k<-4
+groups<- cutree(hc_result, k=k)
+table(groups)
+plot(hc_result, hang <- -1, labels=metadata$`smoking status:ch1`, cex = 0.5)
+rect.hclust(hc_result, k, which = NULL, x = NULL, h = NULL, border = 2, cluster = NULL) # red boxes to show groups
+```
+
+not too sure about what to say there, but using silhouette width I can tune the k to see the better split
+
+```{r}
+# HC K-TUING 
+set.seed(123)
+
+sil_scores <- numeric()
+
+for (k in 2:10) {
+  groups <- cutree(hc_result, k = k)
+  sil <- silhouette(groups, dist_matrix)
+  sil_scores[k] <- mean(sil[, 3])
+}
+
+# Plot silhouette scores
+plot(2:10, sil_scores[2:10], type = "b", pch = 19,
+     xlab = "Number of clusters (k)", ylab = "Average silhouette width",
+     main = "Silhouette Analysis for HC")
+
+best_k <- which.max(sil_scores)
+groups <- cutree(hc_result, k = best_k)
+
+# Plot with best_k clusters
+plot(hc_result, hang = -1, labels = metadata$`smoking status:ch1`, cex = 0.5)
+rect.hclust(hc_result, k = best_k, border = 2)
+```
+
+
+## RANDOM FOREST NO CV
+(Since we did pre-processing, we do not need to filter data using Genefiller package)
+
+```{r}
+group <- as.factor(metadata$`smoking status:ch1`)
+
+#BUILD RF
+set.seed(123)
+rf <- randomForest(x = t(ex), y = group, ntree = 1000, importance = TRUE)
+plot(rf, main = "OOB Error vs Number of trees")  # visualize OOB error vs number of trees
+```
+```{r}
+importance_gini <- importance(rf, type = 2)   #mean decrease gini
+importance_acc <- importance(rf, type = 1) #mean decrease acc
+
+# Sort and plot top 500 genes (if you have that many)
+top_n_gini <- min(500, length(importance_gini))
+top_n_acc <- min(500, length(importance_acc))
+plot(sort(importance_gini, decreasing = TRUE)[1:top_n_gini], type = "l",
+     main = paste("Top", top_n_gini, "Gene Importances"),
+     xlab = "Genes", ylab = "Importance (Gini)")
+
+plot(sort(importance_acc, decreasing = TRUE)[1:top_n_acc], type = "l",
+     main = paste("Top", top_n_acc, "Gene Importances"),
+     xlab = "Genes", ylab = "Importance (Accuracy)")
+```
+
+## RANDOM FOREST WITH CV
+But we prefer to use the CV trees
+
+```{r}
+tex <- t(ex)
+dat <- cbind(as.data.frame(tex), Group = group)
+#set up cv
+control <- trainControl(method = "cv", number = 10)
+metric <- "Accuracy"
+#train rf
+set.seed(123)
+fit.rf <- train(
+  Group ~ ., 
+  data = dat, 
+  method = "rf",
+  metric = metric,
+  trControl = control,
+  ntree = 500,
+)
+
+#extract importance
+importance_vals <- varImp(fit.rf, scale = FALSE)
+importance_df <- importance_vals$importance
+importance_df$Probe <- rownames(importance_df)
+
+#select top200
+top200 <- importance_df[order(-importance_df$Overall), ][1:200, "Probe"]
+#save file
+write.csv(top200, file = "top200_probes_rf_smoking.csv", row.names = FALSE, quote = FALSE)
+#plot of top  500
+plot(sort(importance_df$Overall, decreasing = TRUE)[1:500],
+     type = "l",
+     main = "Top 500 Probes by RF Importance",
+     ylab = "Importance Score",
+     xlab = "Probe Rank")
+
+plot(fit.rf, main = "OOB Error vs Number of trees (CV)")
+
+
+
+```
+## HEATMAP REPRESENTATION PLOT
+
+```{r}
+# STEP 1: Get top 25 most important genes from RF
+imp.temp <- abs(rf$importance[, 1])  # Using MeanDecreaseAccuracy
+names(imp.temp) <- rownames(rf$importance)
+
+# Order and extract top 25 gene names
+top25_genes <- names(sort(imp.temp, decreasing = TRUE))[1:25]
+
+# STEP 2: Subset expression data for top 25 genes
+sig.eset <- ex[rownames(ex) %in% top25_genes, ]
+
+# (Optional) Ensure row order matches top 25 order
+sig.eset <- sig.eset[top25_genes, ]
+
+# STEP 3: Prepare sample annotations
+library(pheatmap)
+
+annotation_col <- data.frame(
+  SmokingStatus = metadata$`smoking status:ch1`
+)
+rownames(annotation_col) <- colnames(sig.eset)
+
+# Define annotation colors
+ann_colors <- list(
+  SmokingStatus = c("Smoker" = "#1E88E5", "Never Smoker" = "#FF801F")
+)
+
+# STEP 4: Create the heatmap
+pheatmap(sig.eset,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         annotation_col = annotation_col,
+         annotation_colors = ann_colors,
+         clustering_method = "ward.D2",
+         scale = "row",
+         main = "Heatmap of Top 25 RF Genes (Smoker vs Never Smoker)",
+         color = colorRampPalette(RColorBrewer::brewer.pal(9, "RdBu"))(100))
+
+```
+## LINEAR DISCRIMINANT ANALYSIS
+
+Scelto di splittare 75/25 quindi 59 training e 20 test
+
+```{r}
+# Define the factor with consistent class order
+f <- factor(metadata$`smoking status:ch1`, levels = c("Never Smoker", "Smoker"))
+
+# Perform row-wise t-tests on 'ex' (filtered and scaled expression matrix)
+tt <- rowttests(ex, f)
+
+# Select genes with p-value < 0.1 for LDA input
+keepers <- which(tt$p.value < 0.1)
+ex_sub <- ex[keepers, ]
+
+# Transpose and prepare data frame for modeling
+tex_sub <- t(ex_sub)
+dat <- as.data.frame(tex_sub)
+dat$SMOKER <- f
+
+# Split data into training and test sets (leaving 5 samples per class for testing)
+set.seed(123)
+n_NS <- sum(f == "Never Smoker")
+n_S <- sum(f == "Smoker")
+
+train_idx <- c(
+  sample(which(f == "Never Smoker"), n_NS - 10),
+  sample(which(f == "Smoker"), n_S - 10)
+)
+test_idx <- setdiff(1:length(f), train_idx)
+
+# Fit LDA model on training data
+mod <- lda(SMOKER ~ ., data = dat, prior = c(0.5, 0.5), subset = train_idx)
+
+# Predict on test set
+pred <- predict(mod, dat[test_idx, ])
+
+# Confusion matrix for test set predictions
+conf_mat <- table(Predicted = pred$class, Actual = dat$SMOKER[test_idx])
+print(conf_mat)
+
+# Plot LDA
+plot(mod, main = "LDA: Linear Discriminant")
+
+# Plot LDA scores for test set
+plot(pred$x[,1], ylab = "LDA Axis 1", main = "LDA scores on Test Set")
+text(pred$x[,1], labels = rownames(dat)[test_idx], pos = 3, cex = 0.7)
+
+# Compute ROC and AUC for test predictions
+roc_lda <- roc(response = dat$SMOKER[test_idx],
+               predictor = pred$posterior[, "Smoker"],
+               levels = rev(levels(dat$SMOKER)))
+plot(roc_lda, main = "LDA ROC Curve", col = "#1b9e77", lwd = 2)
+cat("AUC:", auc(roc_lda), "\n")
+
+```
+
+```{r}
+# LDA vs RF comparison with 10-fold cross-validation
+
+set.seed(123)
+control <- trainControl(method = "cv", number = 10)
+metric <- "Accuracy"
+
+# LDA model with CV
+fit.lda_check <- train(
+  SMOKER ~ ., data = dat,
+  method = "lda",
+  metric = metric,
+  trControl = control
+)
+
+# Random Forest model with CV
+fit.rf_check <- train(
+  SMOKER ~ ., data = dat,
+  method = "rf",
+  metric = metric,
+  trControl = control
+)
+
+# Compare CV results
+results <- resamples(list(LDA = fit.lda_check, RF = fit.rf_check))
+print(summary(results))
+
+# Plot accuracy comparison with ggplot2
+library(ggplot2)
+ggplot(results) +
+  labs(y = "Accuracy", title = "LDA vs Random Forest: 10-Fold CV") +
+  theme_minimal()
+
+```
+
+## LASSO
+Split 75/25
+
+```{r}
+#Iintial fit - O SPLIT
+
+dat <- t(ex)
+labels <- factor(metadata$`smoking status:ch1`, levels = c("Never Smoker", "Smoker"))
+y <- ifelse(labels == "Smoker", 1, 0)
+
+set.seed(123)
+initial_fit=glmnet(dat,y,standardize=FALSE,family="binomial")
+
+plot(initial_fit) #coefficient plot
+
+initial_cfit=cv.glmnet(dat, y, standardize=FALSE, family="binomial")
+plot(initial_cfit)
+
+```
+
+```{r}
+# LASSO fit using TR/TS and CV
+set.seed(123)
+train_idx <- createDataPartition(labels, p = 0.75, list = FALSE)
+test_idx <- setdiff(1:length(labels), train_idx)
+
+x_train <- dat[train_idx, ]
+y_train <- y[train_idx]
+
+x_test <- dat[test_idx, ]
+y_test <- y[test_idx]
+
+# Fit LASSO logistic regression with cross-validation on training set
+set.seed(123)
+cvfit <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 1, standardize = FALSE)
+
+# Plot cross-validation curve
+plot(cvfit)
+
+# Best lambda minimizing cross-validated error
+best_lambda <- cvfit$lambda.min
+cat("Best lambda:", best_lambda, "\n")
+
+# Predict probabilities on test set using best lambda
+pred_probs <- predict(cvfit, newx = x_test, s = best_lambda, type = "response")
+
+# Predicted classes with 0.5 threshold
+pred_classes <- ifelse(pred_probs > 0.5, 1, 0)
+
+# Confusion matrix
+cm <- table(Predicted = pred_classes, Actual = y_test)
+print(cm)
+
+# ROC curve and AUC
+roc_obj <- roc(y_test, as.vector(pred_probs))
+plot(roc_obj, main = "LASSO ROC Curve on Test Set", col = "blue", lwd = 2)
+auc_val <- auc(roc_obj)
+cat("Test set AUC:", auc_val, "\n")
+```
+
+```{r}
+# Extract coefficients at best lambda
+coef_mat <- coef(cvfit, s = best_lambda)
+coef_df <- data.frame(
+  gene = rownames(coef_mat),
+  coefficient = as.vector(coef_mat)
+)
+coef_df <- coef_df[coef_df$gene != "(Intercept)", ]  # remove intercept
+
+# Sort genes by absolute coefficient magnitude
+coef_df <- coef_df[order(abs(coef_df$coefficient), decreasing = TRUE), ]
+
+# Save top 100 genes
+top100_genes <- head(coef_df$gene, 100)
+write.csv(top100_genes, "genes-top100-lasso-smoker.csv", row.names = FALSE, quote = FALSE)
+# Save top 200 genes
+top200_genes <- head(coef_df$gene, 200)
+write.csv(top200_genes, "genes-top200-lasso-smoker.csv", row.names = FALSE, quote = FALSE)
+
+# Save top 500 genes
+top500_genes <- head(coef_df$gene, 500)
+write.csv(top500_genes, "genes-top500-lasso-smoker.csv", row.names = FALSE, quote = FALSE)
+
+# Print top 10 genes with coefficients
+cat("Top 10 genes by LASSO coefficient magnitude:\n")
+print(head(coef_df, 10))
+```
+```{r}
+#DAT CHANGE BC SOTTO NON WORKA
+
+dat <- as.data.frame(t(ex))
+dat$SMOKER <- factor(metadata$`smoking status:ch1`, levels = c("Never Smoker", "Smoker"))
+
+
+```
+
+
+```{r}
+# comparison with other classification methods
+#first fit the lasso check
+set.seed(123)
+fit.lasso_check <- train(
+  SMOKER ~ ., data = dat,
+  method = "glmnet",
+  metric = "Accuracy",
+  trControl = control,
+  tuneLength = 10,
+  family = "binomial",
+  preProcess = NULL
+)
+#fit
+results <- resamples(list(
+  LDA = fit.lda_check,
+  RF = fit.rf_check,
+  Lasso = fit.lasso_check
+))
+
+print(summary(results))
+
+#plot
+ggplot(results) +
+  labs(y = "Accuracy", title = "LDA vs Random Forest vs LASSO: 10-Fold CV") +
+  theme_minimal()
+
+
+
+```
+
+#SCUDO
+
+NO CARET / NO CV
+
+```{r}
+# Define the class factor (Never Smoker vs Smoker)
+f <- factor(metadata$`smoking status:ch1`, levels = c("Never Smoker", "Smoker"))
+
+# Split data into training and test sets (75/25 split)
+set.seed(123)
+inTrain <- createDataPartition(f, p = 0.75, list = FALSE)
+trainData <- ex[, inTrain]
+testData <- ex[, -inTrain]
+
+trainGroups <- f[inTrain]
+testGroups <- f[-inTrain]
+
+# Train SCUDO signatures on training set
+trainRes <- scudoTrain(trainData, groups = trainGroups,
+                       nTop = 25, nBottom = 25, alpha = 0.05)
+
+# Display part of the up-regulated signatures
+head(upSignatures(trainRes)[, 1:5])
+head(consensusUpSignatures(trainRes), 5)
+
+# Generate and plot similarity network of training samples
+trainNet <- scudoNetwork(trainRes, N = 0.2)
+scudoPlot(trainNet, vertex.label = NA, main = "SCUDO Network - Training Set")
+
+# Test the SCUDO model on the test set
+testRes <- scudoTest(trainRes, testData, testGroups,
+                     nTop = 25, nBottom = 25)
+
+# Plot network of test samples
+testNet <- scudoNetwork(testRes, N = 0.2)
+scudoPlot(testNet, vertex.label = NA, main = "SCUDO Network - Test Set")
+```
+
+The next part involves the use of Springlass method but it works onlty for directed graph, but i have undirected,
+solution is to extract the largest connected compoinent
+
+```{r}
+# Identify connected components
+set.seed(123)
+components <- clusters(testNet)
+largest_comp_id <- which.max(components$csize)
+
+# Extract largest component
+testNet_connected <- induced_subgraph(testNet, which(components$membership == largest_comp_id))
+
+# Now run clustering safely
+testClust <- cluster_spinglass(testNet_connected, spins = 2)
+
+# Plot result
+plot(testClust, testNet_connected, vertex.label = NA, main = "SCUDO Clusters on Test Network (Largest Component)")
+
+# Perform classification of test samples
+classRes <- scudoClassify(trainData, testData, N = 0.25,
+                          nTop = 12, nBottom = 12,
+                          trainGroups = trainGroups, alpha = 0.5)
+
+# Confusion matrix for predicted vs actual test labels
+confusionMatrix(classRes$predicted, testGroups)
+```
+
+SCUDO WITH CARET, CV TO TUNE:
+- nTop
+- nBottom
+
+```{r}
+set.seed(123)
+f <- factor(metadata$`smoking status:ch1`, levels = c("Never Smoker", "Smoker"))
+
+# Expression matrix: genes x samples
+# Use scaled expression matrix 'ex' from before
+expr <- ex
+
+# Create a 5-fold cross-validation index for samples (columns)
+folds <- createFolds(f, k = 5, list = TRUE)
+
+# Define grid of nTop and nBottom
+nTop_vals <- seq(10, 30, by = 5)
+nBottom_vals <- seq(10, 30, by = 5)
+
+# Storage for CV results
+results <- data.frame(nTop = integer(), nBottom = integer(), Accuracy = numeric())
+
+for (nt in nTop_vals) {
+  for (nb in nBottom_vals) {
+    acc_vec <- c()
+    for (fold in seq_along(folds)) {
+      test_idx <- folds[[fold]]
+      train_idx <- setdiff(seq_along(f), test_idx)
+      
+      trainData <- expr[, train_idx]
+      testData <- expr[, test_idx]
+      
+      trainGroups <- f[train_idx]
+      testGroups <- f[test_idx]
+      
+      # Train SCUDO
+      trainRes <- scudoTrain(trainData, trainGroups, nTop = nt, nBottom = nb, alpha = 0.05)
+      
+      # Classify test samples
+      classRes <- scudoClassify(trainData, testData, N = 0.25,
+                                nTop = nt, nBottom = nb,
+                                trainGroups = trainGroups, alpha = 0.05)
+      
+      cm <- confusionMatrix(classRes$predicted, testGroups)
+      acc_vec <- c(acc_vec, cm$overall["Accuracy"])
+    }
+    mean_acc <- mean(acc_vec)
+    results <- rbind(results, data.frame(nTop = nt, nBottom = nb, Accuracy = mean_acc))
+    cat(sprintf("nTop=%d, nBottom=%d, Mean Accuracy=%.3f\n", nt, nb, mean_acc))
+  }
+}
+
+# Best parameters
+best_params <- results[which.max(results$Accuracy), ]
+print(best_params)
+
+# Now retrain SCUDO on full data with best parameters
+bestTrainRes <- scudoTrain(expr, f, nTop = best_params$nTop, nBottom = best_params$nBottom, alpha = 0.05)
+```
+
+The scudo network do not have the split it's on the full data bc is the best
+
+```{r}
+#output
+set.seed(123)
+
+# Generate similarity network using the SCUDO model
+trainNet <- scudoNetwork(bestTrainRes, N = 0.2)  # N controls edge density
+
+# Plot the network it
+scudoPlot(trainNet, vertex.label = NA, main = "SCUDO Network - Full Data (Best Params)")
+
+components <- clusters(trainNet)
+largest_comp_id <- which.max(components$csize)
+
+# Extract largest component
+trainNet_connected <- induced_subgraph(trainNet, which(components$membership == largest_comp_id))
+
+# Cluster the largest connected component
+trainClust <- cluster_spinglass(trainNet_connected, spins = 2)
+
+# Plot clusters
+plot(trainClust, trainNet_connected, vertex.label = NA, main = "SCUDO Clusters - Best Model")
+```
+
+## FUCTIONAL ANALYSIS
+
+```{r}
+set.seed(123)
+probe.names <- rownames(rf$importance)
+importance_scores <- rf$importance[,"MeanDecreaseAccuracy"]
+top200 <- probe.names[order(importance_scores, decreasing = TRUE)[1:200]]
+
+write.table(top200,
+            file = "top200_probes.txt",
+            quote = FALSE,
+            row.names = FALSE,
+            col.names = FALSE)
+
+gostres3 <- gost(query = top200,
+                 organism = "hsapiens",
+                 ordered_query = FALSE,
+                 multi_query = FALSE,
+                 significant = TRUE,
+                 exclude_iea = FALSE,
+                 measure_underrepresentation = FALSE,
+                 evcodes = FALSE,
+                 user_threshold = 0.05,
+                 correction_method = "g_SCS",
+                 domain_scope = "annotated",
+                 custom_bg = NULL,
+                 numeric_ns = "",
+                 sources = NULL,
+                 as_short_link = FALSE)
+
+# Plot interactive enrichment results
+# Generate a static ggplot object
+p <- gostplot(gostres3, capped = TRUE, interactive = FALSE)
+
+# Add a custom title
+p <- p + ggtitle("Functional Analysis")
+
+# Display the plot
+print(p)
+
+
+```
+```{r}
+summary(gostres3)
+head(gostres3)
+```
+
+
+## NETWORK ANALYSIS PATHFINDER
+
+```{r}
+set.seed(123)
+# 1. Load top 100 probe IDs from file
+top100_probes <- read.csv("genes-top100-lasso-smoker.csv", stringsAsFactors = FALSE)$x
+top100_probes <- gsub("`", "", top100_probes)  # Clean any backticks
+
+# 2. Run t-tests between Smoker and Never Smoker groups
+tt_results <- rowttests(ex, f)  # ex: 803 x 79 expression matrix; f: factor vector of groups
+
+# 3. Subset t-test results to top probes
+filtered_tt <- tt_results[top100_probes, , drop = FALSE]
+
+# 4. Map probe IDs to gene symbols using AnnotationDbi (cleaner than manual list)
+symbol_map <- AnnotationDbi::select(
+  hgu133a.db,
+  keys = rownames(filtered_tt),
+  columns = "SYMBOL",
+  keytype = "PROBEID"
+)
+
+# 5. Merge mapping with t-test results
+# Ensure rownames match probe IDs
+filtered_tt$Probe <- rownames(filtered_tt)
+tt_df <- merge(filtered_tt, symbol_map, by.x = "Probe", by.y = "PROBEID")
+
+# 6. Build final input data frame for pathfindR
+probe_df <- data.frame(
+  Gene.symbol = tt_df$SYMBOL,
+  logFC = tt_df$statistic,
+  p.value = tt_df$p.value,
+  stringsAsFactors = FALSE
+)
+
+# Remove any incomplete rows (just in case)
+probe_df <- na.omit(probe_df)
+
+# 7. Run KEGG pathway enrichment analysis using pathfindR
+
+results_lasso_smoker <- run_pathfindR(probe_df, iterations = 5) #enrichment plot
+```
+
+
+```{r}
+# 8. Check top results
+head(results_lasso_smoker)
+
+# 9. Cluster enriched terms
+clustered_lasso <- cluster_enriched_terms(results_lasso_smoker) #dendrogram + clustering
+
+# 10. Visualizations
+term_gene_graph(results_lasso_smoker) #term-gene-graph
+cluster_enriched_terms(clustered_lasso) #dendrogram (same) + cluster_enriched terms
+```
+##  REACTOME PATHFINDER
+
+```{r}
+set.seed(123)
+# Run Reactome analysis
+RA_lasso_reactome <- run_pathfindR(
+  probe_df,
+  gene_sets = "Reactome",
+  pin_name_path = "GeneMania",
+  iterations = 5
+)
+
+# Cluster enriched terms
+clustered_lasso_reactome <- cluster_enriched_terms(RA_lasso_reactome) #dendrogram + reactome clustering
+
+term_gene_graph(results_lasso_smoker)   #term-gene-grap reactome
+cluster_enriched_terms(clustered_lasso_reactome) #dendrogram + cluster reactome
+
+```
+## OTER NETWORK (STRING )
+
+Done online
+
+```{r}
+# Save gene list to text file (one gene per line)
+writeLines(probe_df$Gene.symbol, "genes_for_enrichnet.txt")
+```
+
+
+
+
+```{r}
+library(STRINGdb)
+
+# 1. Initialize STRINGdb (species 9606 = Homo sapiens, version 11.5 or latest)
+string_db <- STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400)
+
+# 2. Use the same probe_df you used for pathfindR (Gene.symbols)
+# Ensure gene symbols are available
+gene_list <- probe_df$Gene.symbol
+
+# 3. Create a data frame and map to STRING
+genes_df <- data.frame(gene = gene_list, stringsAsFactors = FALSE)
+genes_mapped <- string_db$map(genes_df, "gene", removeUnmappedRows = TRUE)
+
+# 4. Plot network
+string_db$plot_network(genes_mapped$STRING_id)
+
+# 5. Perform enrichment analysis
+enrich_df <- string_db$get_enrichment(genes_mapped$STRING_id, category = "KEGG")
+
+# 6. View top enriched KEGG pathways
+head(enrich_df)
+
+
+```
+
+
